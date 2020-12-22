@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Write},
 };
@@ -13,12 +14,29 @@ use reqwest::blocking::Client;
 #[derive(Clap, Clone, Debug)]
 #[clap(version = crate_version!(), author = crate_authors!())]
 struct Opts {
-    id: String,
+    // A puzzle url or identifier
+    puzzle: String,
+
+    // The path of the output file. By default, this path is <puzzle>.csv, where
+    // puzzle is the puzzle's identifier.
+    path: Option<String>,
 }
 
 impl Opts {
     fn url(&self) -> String {
-        format!("https://grid.websudoku.com/?level=1&set_id={}", self.id)
+        let pattern = Regex::new(r#"set_id=(\d+)"#).unwrap();
+
+        let id = match pattern.captures(&self.puzzle) {
+            Some(captures) => Cow::from(
+                captures
+                    .get(1)
+                    .expect("Non-optional capture group should not fail")
+                    .as_str(),
+            ),
+            None => Cow::from(self.puzzle.replace(',', "")),
+        };
+
+        format!("https://grid.websudoku.com/?level=1&set_id={}", id)
     }
 }
 
@@ -64,13 +82,38 @@ struct Puzzle {
 
 impl Puzzle {
     fn write_masked_puzzle(&self, mut w: impl Write) -> io::Result<()> {
+        struct Indexes(u8);
+
+        impl Default for Indexes {
+            fn default() -> Self {
+                Indexes(1)
+            }
+        }
+
+        impl Iterator for Indexes {
+            type Item = u8;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self.0 {
+                    9 => {
+                        self.0 = 1;
+                        Some(9)
+                    }
+
+                    idx => {
+                        self.0 += 1;
+                        Some(idx)
+                    }
+                }
+            }
+        }
+
         let rows = self.solution.chunks(9).filter(|&x| x.len() == 9);
         let row_masks = self.mask.chunks(9).filter(|&x| x.len() == 9);
 
         for (row, mask) in rows.zip(row_masks) {
-            let mut col_idx = 0u8;
-            for (&value, &can_edit) in row.iter().zip(mask) {
-                if col_idx == 8 {
+            for (idx, (&value, &can_edit)) in row.iter().zip(mask).enumerate() {
+                if idx == 8 {
                     if !can_edit {
                         write!(w, "{},", value)?;
                     }
@@ -81,7 +124,6 @@ impl Puzzle {
                         write!(w, "{},", value)?;
                     }
                 }
-                col_idx += 1;
             }
             w.write_all(b"\n")?;
         }
@@ -124,7 +166,7 @@ fn input_regex() -> Regex {
 mod test {
     #[test]
     fn input_regex_works() {
-        let content = include_str!("../sample.html");
+        let content = include_str!("../resource/sample.html");
         let extractor = super::PuzzleExtractor::new();
 
         let actual = extractor.extract(content).unwrap();
