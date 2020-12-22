@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    fmt::{self, Display},
     io::{self, Write},
+    str::FromStr,
 };
 
 use clap::{crate_authors, crate_version, Clap};
@@ -10,23 +12,77 @@ use regex::{Regex, RegexBuilder};
 
 use reqwest::blocking::Client;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Difficulty {
+    Easy,
+    Medium,
+    Hard,
+    Evil,
+}
+
+impl Difficulty {
+    fn level(self) -> u8 {
+        match self {
+            Difficulty::Easy => 1,
+            Difficulty::Medium => 2,
+            Difficulty::Hard => 3,
+            Difficulty::Evil => 4,
+        }
+    }
+}
+
+impl Default for Difficulty {
+    fn default() -> Self {
+        Difficulty::Evil
+    }
+}
+
+impl Display for Difficulty {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Difficulty::Easy => f.write_str("Easy"),
+            Difficulty::Medium => f.write_str("Medium"),
+            Difficulty::Hard => f.write_str("Hard"),
+            Difficulty::Evil => f.write_str("Evil"),
+        }
+    }
+}
+
+impl FromStr for Difficulty {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_ref() {
+            "easy" => Ok(Difficulty::Easy),
+            "medium" => Ok(Difficulty::Medium),
+            "hard" => Ok(Difficulty::Hard),
+            "evil" => Ok(Difficulty::Evil),
+
+            _ => Err(format!("Unrecognized difficulty setting: {}", s)),
+        }
+    }
+}
+
 /// Download a websudoku puzzle by id
 #[derive(Clap, Clone, Debug)]
 #[clap(version = crate_version!(), author = crate_authors!())]
 struct Opts {
-    // A puzzle url or identifier
+    /// The difficulty level of the puzzle (default: EVIL)
+    #[clap(short, long)]
+    difficulty: Option<Difficulty>,
+
+    /// A puzzle url or identifier
     puzzle: String,
 
-    // The path of the output file. By default, this path is <puzzle>.csv, where
-    // puzzle is the puzzle's identifier.
+    /// The path of the output file. By default, this path is <puzzle>.csv, where
+    /// puzzle is the puzzle's identifier.
     path: Option<String>,
 }
 
 impl Opts {
-    fn url(&self) -> String {
-        let pattern = Regex::new(r#"set_id=(\d+)"#).unwrap();
-
-        let id = match pattern.captures(&self.puzzle) {
+    fn params(&mut self) -> (Difficulty, String) {
+        let id_pattern = Regex::new(r#"set_id=(\d+)"#).unwrap();
+        let id = match id_pattern.captures(&self.puzzle) {
             Some(captures) => Cow::from(
                 captures
                     .get(1)
@@ -36,7 +92,29 @@ impl Opts {
             None => Cow::from(self.puzzle.replace(',', "")),
         };
 
-        format!("https://grid.websudoku.com/?level=1&set_id={}", id)
+        let difficulty_pattern = Regex::new(r#"level=(\d)"#).unwrap();
+        let difficulty = match difficulty_pattern.captures(&self.puzzle) {
+            None => self.difficulty.unwrap_or_default(),
+            Some(captures) => match captures
+                .get(1)
+                .expect("Non-optional capture group should not fail")
+                .as_str()
+            {
+                "1" => Difficulty::Easy,
+                "2" => Difficulty::Medium,
+                "3" => Difficulty::Hard,
+                _ => Difficulty::Evil,
+            },
+        };
+
+        (
+            difficulty,
+            format!(
+                "https://grid.websudoku.com/?level={}&set_id={}",
+                difficulty.level(),
+                id
+            ),
+        )
     }
 }
 
@@ -51,7 +129,7 @@ impl PuzzleExtractor {
         }
     }
 
-    fn extract(&self, content: &str) -> Option<Puzzle> {
+    fn extract(&self, difficulty: Difficulty, content: &str) -> Option<Puzzle> {
         static PUZZLE_ID: &str = "pid";
         static SOLUTION: &str = "cheat";
         static MASK: &str = "editmask";
@@ -59,6 +137,7 @@ impl PuzzleExtractor {
         let map = self.build_extraction_map(content);
 
         Some(Puzzle {
+            difficulty,
             id: map.get(PUZZLE_ID)?.to_string(),
             solution: map.get(SOLUTION)?.bytes().map(|u| u - b'0').collect(),
             mask: map.get(MASK)?.bytes().map(|u| u == b'1').collect(),
@@ -75,6 +154,7 @@ impl PuzzleExtractor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Puzzle {
+    difficulty: Difficulty,
     id: String,
     solution: Vec<u8>,
     mask: Vec<bool>,
@@ -135,13 +215,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     static USER_AGENT: &str =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0";
 
-    let opts = Opts::parse();
+    let (difficulty, url) = Opts::parse().params();
     let extractor = PuzzleExtractor::new();
     let client = Client::builder().user_agent(USER_AGENT).build()?;
 
-    let content = client.get(&opts.url()).send()?.text()?;
+    let content = client.get(&url).send()?.text()?;
     let puzzle = extractor
-        .extract(&content)
+        .extract(difficulty, &content)
         .expect("Unable to extract puzzle data");
 
     write_csv(&puzzle)?;
@@ -151,7 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn write_csv(puzzle: &Puzzle) -> io::Result<()> {
     use std::fs::File;
-    puzzle.write_masked_puzzle(File::create(&format!("{}.csv", puzzle.id))?)
+    puzzle.write_masked_puzzle(File::create(&format!(
+        "{} {}.csv",
+        puzzle.difficulty, puzzle.id
+    ))?)
 }
 
 fn input_regex() -> Regex {
@@ -164,13 +247,16 @@ fn input_regex() -> Regex {
 
 #[cfg(test)]
 mod test {
+    use super::{Difficulty, Puzzle, PuzzleExtractor};
+
     #[test]
     fn input_regex_works() {
         let content = include_str!("../resource/sample.html");
-        let extractor = super::PuzzleExtractor::new();
+        let extractor = PuzzleExtractor::new();
 
-        let actual = extractor.extract(content).unwrap();
-        let expected = super::Puzzle {
+        let actual = extractor.extract(Difficulty::Evil, content).unwrap();
+        let expected = Puzzle {
+            difficulty: Difficulty::Evil,
             id: String::from("7042100266"),
             solution: vec![
                 9, 8, 4, 2, 7, 3, 6, 5, 1, 7, 1, 5, 6, 8, 4, 9, 2, 3, 3, 2, 6, 9, 5, 1, 7, 4, 8, 8,
